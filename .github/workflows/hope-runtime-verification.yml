@@ -1,0 +1,671 @@
+name: HOPE Runtime Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_device_certification:
+        description: "Run Android emulator/device certification"
+        required: true
+        default: true
+        type: boolean
+      run_postgres_runtime:
+        description: "Run PostgreSQL + migrations + postgres tests"
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.47.2"
+  NODE_VERSION: "24.x"
+  ANDROID_API_LEVEL: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK: "28.2.13676358"
+
+  # Exact build command requested for the release APK.
+  BUILD_API_BASE_URL: "https://staging.example.com/api/v1"
+
+  # Real staging endpoint must be stored as a GitHub secret.
+  STAGING_API_BASE_URL: ${{ secrets.STAGING_API_BASE_URL }}
+
+  POSTGRES_USER: hope
+  POSTGRES_PASSWORD: hope
+  POSTGRES_DB: hope_test
+
+jobs:
+  runtime-certification:
+    name: Full Runtime Certification
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hope
+          POSTGRES_PASSWORD: hope
+          POSTGRES_DB: hope_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U hope -d hope_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: System information
+        shell: bash
+        run: |
+          set -u
+          {
+            echo "=== OS ==="
+            uname -a || true
+            cat /etc/os-release || true
+
+            echo "=== CPU ==="
+            nproc || true
+
+            echo "=== Memory ==="
+            free -h || true
+
+            echo "=== Docker ==="
+            docker --version || true
+            docker compose version || true
+          } 2>&1 | tee "$RUNNER_TEMP/system-info.log"
+
+      - name: Bootstrap project from ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/ci/bootstrap-project.sh
+          .github/ci/bootstrap-project.sh
+
+      - name: Load PROJECT_DIR
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="$(grep '^PROJECT_DIR=' "$RUNNER_TEMP/hope-project-dir.txt" | cut -d= -f2-)"
+          echo "PROJECT_DIR=${PROJECT_DIR}" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=${PROJECT_DIR}"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ env.PROJECT_DIR }}/backend/package-lock.json
+
+      - name: Verify installed toolchains
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          {
+            echo "=== Flutter ==="
+            flutter --version
+
+            echo "=== Dart ==="
+            dart --version
+
+            echo "=== Node ==="
+            node --version
+
+            echo "=== npm ==="
+            npm --version
+
+            echo "=== Java ==="
+            java -version
+
+            echo "=== Android ==="
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+            echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          } 2>&1 | tee "$RUNNER_TEMP/toolchain.log"
+
+      - name: Provision certified Android SDK/NDK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+
+          if [[ -z "$SDKMANAGER" && -n "${ANDROID_SDK_ROOT:-}" && -x "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" ]]; then
+            SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "::error::sdkmanager not found"
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK}"
+
+          "$SDKMANAGER" --list_installed | tee "$RUNNER_TEMP/android-sdk-installed.txt"
+
+          echo "=== Android toolchain verification ==="
+          grep -Fq "platforms;android-${ANDROID_API_LEVEL}" \
+            "$RUNNER_TEMP/android-sdk-installed.txt"
+
+          grep -Fq "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "$RUNNER_TEMP/android-sdk-installed.txt"
+
+          grep -Fq "ndk;${ANDROID_NDK}" \
+            "$RUNNER_TEMP/android-sdk-installed.txt"
+
+      # ============================================================
+      # 1) FLUTTER TOOLCHAIN
+      # ============================================================
+
+      - name: "01A - flutter pub get"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/hope-logs"
+          flutter pub get 2>&1 | tee "$RUNNER_TEMP/hope-logs/01_flutter_pub_get.log"
+          rc=${PIPESTATUS[0]}
+          echo "EXIT_CODE=${rc}" | tee -a "$RUNNER_TEMP/hope-logs/01_flutter_pub_get.log"
+          exit "$rc"
+
+      - name: "01B - flutter analyze --fatal-infos"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set +e
+          flutter analyze --fatal-infos 2>&1 | tee "$RUNNER_TEMP/hope-logs/01_flutter_analyze.log"
+          rc=${PIPESTATUS[0]}
+          echo "EXIT_CODE=${rc}" | tee -a "$RUNNER_TEMP/hope-logs/01_flutter_analyze.log"
+          exit "$rc"
+
+      - name: "01C - flutter test"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set +e
+          flutter test 2>&1 | tee "$RUNNER_TEMP/hope-logs/01_flutter_test.log"
+          rc=${PIPESTATUS[0]}
+          echo "EXIT_CODE=${rc}" | tee -a "$RUNNER_TEMP/hope-logs/01_flutter_test.log"
+          exit "$rc"
+
+      - name: "01D - flutter integration_test"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set +e
+
+          if [[ ! -d integration_test ]]; then
+            echo "No integration_test directory exists."
+            echo "EXIT_CODE=0"
+            exit 0
+          fi
+
+          flutter test integration_test/ 2>&1 \
+            | tee "$RUNNER_TEMP/hope-logs/01_flutter_integration_test.log"
+
+          rc=${PIPESTATUS[0]}
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/01_flutter_integration_test.log"
+
+          exit "$rc"
+
+      # ============================================================
+      # 2) ANDROID BUILD
+      # ============================================================
+
+      - name: "02 - flutter build apk --release"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set +e
+
+          flutter build apk \
+            --release \
+            --dart-define=API_BASE_URL=https://staging.example.com/api/v1 \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/02_android_build.log"
+
+          rc=${PIPESTATUS[0]}
+
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/02_android_build.log"
+
+          if [[ "$rc" -eq 0 ]]; then
+            APK="$(find build/app/outputs/flutter-apk -type f -name '*.apk' | sort | head -n 1)"
+
+            if [[ -z "$APK" ]]; then
+              echo "::error::Build succeeded but no APK was found."
+              rc=1
+            else
+              echo "APK=${APK}" | tee "$RUNNER_TEMP/hope-apk.txt"
+
+              echo "=== APK SHA256 ==="
+              sha256sum "$APK" \
+                | tee "$RUNNER_TEMP/hope-logs/02_apk_sha256.log"
+            fi
+          fi
+
+          exit "$rc"
+
+      - name: "02B - APK metadata"
+        if: always()
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set +e
+
+          if [[ ! -f "$RUNNER_TEMP/hope-apk.txt" ]]; then
+            echo "APK metadata skipped: no APK path."
+            exit 0
+          fi
+
+          APK="$(cut -d= -f2- "$RUNNER_TEMP/hope-apk.txt")"
+
+          echo "APK=$APK"
+
+          "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/aapt" \
+            dump badging "$APK" \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/02_apk_badging.log"
+
+          "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/apksigner" \
+            verify --verbose "$APK" \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/02_apk_apksigner.log"
+
+          exit 0
+
+      # ============================================================
+      # 3) BACKEND STATIC + FAST TESTS
+      # ============================================================
+
+      - name: "03A - npm ci"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        run: |
+          set +e
+          npm ci 2>&1 | tee "$RUNNER_TEMP/hope-logs/03_npm_ci.log"
+          rc=${PIPESTATUS[0]}
+          echo "EXIT_CODE=${rc}" | tee -a "$RUNNER_TEMP/hope-logs/03_npm_ci.log"
+          exit "$rc"
+
+      - name: "03B - npm run check"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        run: |
+          set +e
+          npm run check 2>&1 | tee "$RUNNER_TEMP/hope-logs/03_npm_check.log"
+          rc=${PIPESTATUS[0]}
+          echo "EXIT_CODE=${rc}" | tee -a "$RUNNER_TEMP/hope-logs/03_npm_check.log"
+          exit "$rc"
+
+      - name: "03C - npm run test:fast"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        run: |
+          set +e
+          npm run test:fast 2>&1 | tee "$RUNNER_TEMP/hope-logs/03_npm_test_fast.log"
+          rc=${PIPESTATUS[0]}
+          echo "EXIT_CODE=${rc}" | tee -a "$RUNNER_TEMP/hope-logs/03_npm_test_fast.log"
+          exit "$rc"
+
+      - name: "03D - npm audit --json"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        continue-on-error: true
+        run: |
+          set +e
+
+          npm audit --audit-level=high --json \
+            > "$RUNNER_TEMP/hope-logs/03_npm_audit.json" \
+            2> "$RUNNER_TEMP/hope-logs/03_npm_audit.stderr"
+
+          rc=$?
+
+          cat "$RUNNER_TEMP/hope-logs/03_npm_audit.json"
+          cat "$RUNNER_TEMP/hope-logs/03_npm_audit.stderr"
+
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/03_npm_audit.stderr"
+
+          exit "$rc"
+
+      # ============================================================
+      # 4) POSTGRES RUNTIME
+      # ============================================================
+
+      - name: "04A - PostgreSQL readiness"
+        if: ${{ github.event_name == 'push' || inputs.run_postgres_runtime }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for i in {1..30}; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U hope -d hope_test; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::PostgreSQL did not become ready."
+          exit 1
+        env:
+          PGPASSWORD: hope
+
+      - name: "04B - docker compose inspection"
+        if: ${{ github.event_name == 'push' || inputs.run_postgres_runtime }}
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        continue-on-error: true
+        run: |
+          set +e
+
+          if [[ -f docker-compose.yml || -f docker-compose.yaml ]]; then
+            docker compose config 2>&1 \
+              | tee "$RUNNER_TEMP/hope-logs/04_docker_compose_config.log"
+          else
+            echo "backend/docker-compose.yml not found."
+          fi
+
+          exit 0
+
+      - name: "04C - node src/migrate.js"
+        if: ${{ github.event_name == 'push' || inputs.run_postgres_runtime }}
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        run: |
+          set +e
+
+          DATABASE_URL="postgresql://hope:hope@127.0.0.1:5432/hope_test" \
+            node src/migrate.js \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/04_migrate.log"
+
+          rc=${PIPESTATUS[0]}
+
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/04_migrate.log"
+
+          exit "$rc"
+
+      - name: "04D - npm run test:postgres"
+        if: ${{ github.event_name == 'push' || inputs.run_postgres_runtime }}
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        run: |
+          set +e
+
+          DATABASE_URL="postgresql://hope:hope@127.0.0.1:5432/hope_test" \
+            npm run test:postgres \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/04_test_postgres.log"
+
+          rc=${PIPESTATUS[0]}
+
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/04_test_postgres.log"
+
+          exit "$rc"
+
+      # ============================================================
+      # 5) PROVIDER / FAILURE INJECTION
+      # ============================================================
+
+      - name: "05A - npm run test:provider"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        run: |
+          set +e
+
+          PAYMENT_PROVIDER=simulator \
+            npm run test:provider \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/05_provider.log"
+
+          rc=${PIPESTATUS[0]}
+
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/05_provider.log"
+
+          exit "$rc"
+
+      - name: "05B - npm run test:failure-injection"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        run: |
+          set +e
+
+          PAYMENT_PROVIDER=simulator \
+            npm run test:failure-injection \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/05_failure_injection.log"
+
+          rc=${PIPESTATUS[0]}
+
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/05_failure_injection.log"
+
+          exit "$rc"
+
+      # ============================================================
+      # 6) DISASTER RECOVERY
+      # ============================================================
+
+      - name: "06 - DR restore drill"
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}/backend
+        continue-on-error: true
+        env:
+          DRILL_DATABASE_URL: postgresql://hope:hope@127.0.0.1:5432/hope_test
+          DATABASE_URL: postgresql://hope:hope@127.0.0.1:5432/hope_test
+        run: |
+          set +e
+
+          chmod +x scripts/dr-restore-drill.sh
+
+          ./scripts/dr-restore-drill.sh \
+            2>&1 | tee "$RUNNER_TEMP/hope-logs/06_dr_restore_drill.log"
+
+          rc=${PIPESTATUS[0]}
+
+          echo "EXIT_CODE=${rc}" \
+            | tee -a "$RUNNER_TEMP/hope-logs/06_dr_restore_drill.log"
+
+          exit "$rc"
+
+      # ============================================================
+      # 7) ANDROID DEVICE CERTIFICATION
+      # ============================================================
+
+      - name: "07 - Android emulator certification"
+        if: ${{ github.event_name == 'push' || inputs.run_device_certification }}
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          API_BASE_URL: ${{ secrets.STAGING_API_BASE_URL }}
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          emulator-options: >-
+            -no-window
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+          disable-animations: true
+          script: |
+            set +e
+
+            cd "$PROJECT_DIR"
+
+            echo "=== ADB devices ==="
+            adb devices -l
+
+            APK=""
+            if [[ -f "$RUNNER_TEMP/hope-apk.txt" ]]; then
+              APK="$(cut -d= -f2- "$RUNNER_TEMP/hope-apk.txt")"
+            fi
+
+            if [[ -n "$APK" && -f "$APK" ]]; then
+              echo "=== Installing release APK ==="
+
+              adb install -r "$APK" \
+                2>&1 | tee "$RUNNER_TEMP/hope-logs/07_adb_install.log"
+
+              install_rc=${PIPESTATUS[0]}
+
+              echo "EXIT_CODE=${install_rc}" \
+                | tee -a "$RUNNER_TEMP/hope-logs/07_adb_install.log"
+
+              if [[ "$install_rc" -ne 0 ]]; then
+                exit "$install_rc"
+              fi
+
+              echo "Release APK installed successfully."
+            else
+              echo "WARNING: release APK path unavailable; integration test can still run."
+            fi
+
+            echo "=== Integration test candidates ==="
+            find integration_test -maxdepth 2 -type f -print 2>/dev/null | sort
+
+            TEST_FILE=""
+
+            if [[ -f integration_test/app_smoke_test.dart ]]; then
+              TEST_FILE="integration_test/app_smoke_test.dart"
+            else
+              TEST_FILE="$(find integration_test -maxdepth 2 -type f -name '*test.dart' \
+                | sort | head -n 1)"
+            fi
+
+            if [[ -z "$TEST_FILE" ]]; then
+              echo "::error::No integration test file found."
+              exit 1
+            fi
+
+            echo "Running: $TEST_FILE"
+
+            set -o pipefail
+
+            flutter test --no-pub "$TEST_FILE" \
+              --dart-define=API_BASE_URL="$API_BASE_URL" \
+              --dart-define=CI_DEVICE_INTEGRATION=true \
+              -d emulator-5554 \
+              2>&1 | tee "$RUNNER_TEMP/hope-logs/07_flutter_device_integration.log"
+
+            TEST_RC=${PIPESTATUS[0]}
+
+            echo "=== logcat: full capture ==="
+            adb logcat -d -v threadtime \
+              > "$RUNNER_TEMP/hope-logs/07_logcat_full.txt"
+
+            echo "=== logcat: fatal/exception markers ==="
+
+            grep -nE \
+              'FATAL EXCEPTION|AndroidRuntime|Exception|FlutterError|PlatformException|SIGABRT|SIGSEGV' \
+              "$RUNNER_TEMP/hope-logs/07_logcat_full.txt" \
+              | tee "$RUNNER_TEMP/hope-logs/07_logcat_errors.txt" || true
+
+            echo "=== EXIT_CODE ==="
+            echo "$TEST_RC"
+
+            exit "$TEST_RC"
+
+      # ============================================================
+      # REPORTING
+      # ============================================================
+
+      - name: Generate final machine-readable report
+        if: always()
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set +e
+
+          REPORT="$RUNNER_TEMP/hope-final-report.md"
+
+          {
+            echo "# HOPE Runtime Certification Report"
+            echo
+            echo "- Run: $GITHUB_RUN_ID"
+            echo "- Repository: $GITHUB_REPOSITORY"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Workflow: $GITHUB_WORKFLOW"
+            echo "- Runner: $RUNNER_OS"
+            echo
+            echo "## Toolchain"
+            echo
+            echo "- Flutter: $FLUTTER_VERSION"
+            echo "- Node: $NODE_VERSION"
+            echo "- Android API: $ANDROID_API_LEVEL"
+            echo "- Build Tools: $ANDROID_BUILD_TOOLS"
+            echo "- NDK: $ANDROID_NDK"
+            echo
+            echo "## Requested verification matrix"
+            echo
+            echo "| بخش | دستور | نتیجه |"
+            echo "|---|---|---|"
+            echo "| 1 | flutter pub get / analyze --fatal-infos / test / integration_test | See individual logs |"
+            echo "| 2 | flutter build apk --release --dart-define=API_BASE_URL=https://staging.example.com/api/v1 | See build log + SHA256 |"
+            echo "| 3 | npm ci / npm run check / npm run test:fast / npm audit --json | See individual logs |"
+            echo "| 4 | PostgreSQL 16 / node src/migrate.js / npm run test:postgres | See individual logs |"
+            echo "| 5 | npm run test:provider / npm run test:failure-injection | See individual logs |"
+            echo "| 6 | backend/scripts/dr-restore-drill.sh | See DR log |"
+            echo "| 7 | Android emulator / APK install / integration test / logcat | See device logs |"
+            echo
+            echo "## Artifacts"
+            echo
+            echo "Full stdout/stderr logs are uploaded as workflow artifacts."
+          } > "$REPORT"
+
+          cat "$REPORT"
+
+          if [[ -f "$GITHUB_STEP_SUMMARY" ]]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload complete runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hope-runtime-evidence-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/hope-logs/
+            ${{ runner.temp }}/hope-*.txt
+            ${{ runner.temp }}/hope-*.log
+            ${{ runner.temp }}/hope-final-report.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hope-apk-${{ github.run_id }}
+          path: |
+            ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: warn
+          retention-days: 14
